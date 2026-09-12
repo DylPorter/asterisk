@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">ShortCheck</string>
+    <string name="service_label">ShortCheck fact-check overlay</string>
+    <string name="service_description">Reads the title of the YouTube Short on screen so it can be fact-checked. No screenshots, no audio, no other screen content.</string>
+</resources>

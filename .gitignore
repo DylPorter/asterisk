@@ -1,0 +1,18 @@
+# secrets
+.env
+.env.*
+!.env.example
+cookies.txt
+*cookies*.txt
+server/out/
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# android
+android/build/
+android/app/build/
+android/.gradle/
+android/local.properties
