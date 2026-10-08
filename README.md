@@ -6,6 +6,9 @@ YouTube app. Built at AI Tinkerers Hong Kong, "Agents Everywhere".
 An agent that lives in a place people already spend time — not a chatbox you
 have to go to.
 
+
+> **v2 (branch `v2-tap-capture`):** v2 no longer searches for the video by title. The app captures the audio actually playing in YouTube, TikTok or Instagram and transcribes it. It stays on-device until you've watched for 5 s, and nothing is checked until you tap ✱. Claims whose quote doesn't match the transcript are dropped in code. See [docs/V2-ARCHITECTURE.md](docs/V2-ARCHITECTURE.md) and [server/eval/README.md](server/eval/README.md). The rest of this README describes v1.
+
 ## How it works
 
 1. **Accessibility service** reads the on-screen view tree and pulls two

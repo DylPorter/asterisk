@@ -1,19 +1,24 @@
 package dev.tdporter.shortcheck
 
 import android.accessibilityservice.AccessibilityService
+import android.graphics.Rect
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 /**
- * Watches the YouTube app for a Short on screen and reports which one.
+ * Watches YouTube, TikTok and Instagram for a reel on screen and reports
+ * WHICH one, as a reel key (`app|channel|title`) fed to [ReelTracker].
+ *
+ * v2 change: this class no longer fact-checks anything itself. v1 fired a
+ * check per Short from here; now it only says "reel X is on screen" / "no
+ * reel", the tracker turns that into dwell events, and the capture/upload side
+ * acts on those. Nothing is checked until the user taps the ✱.
+ *
+ * YouTube detection, below, is unchanged from v1 and device-verified:
  *
  * Verified against YouTube 21.36.45 on Android 17 (Pixel 7) by dumping the
  * live view hierarchy. Two findings shape this code:
@@ -28,30 +33,62 @@ import kotlinx.coroutines.withContext
  */
 class ShortsAccessibilityService : AccessibilityService() {
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private var inFlight: Job? = null
+    private val tracker = ReelTracker()
+    private val main = Handler(Looper.getMainLooper())
 
-    /** Identity of the Short currently being shown, so we ignore repeat events. */
-    private var currentKey: String? = null
+    /** Hints for the key about to be passed to the tracker; read on Started. */
+    private var pendingHints: ReelHints? = null
 
     /** Title of whatever is on screen right now, even if not yet identified. */
     private var lastVisibleTitle: String? = null
 
+    /** Consecutive ticks on which the active window was not a watched app. */
+    private var offAppTicks = 0
+    private var ticking = false
+    private var lastTreeDump = 0L
+
+    /**
+     * Accessibility events only arrive while something on screen changes, and
+     * a reel that just plays emits none -- so the dwell clock needs its own
+     * timer. It also catches leaving the app: packageNames in the config means
+     * we get NO event when the launcher or another app comes up, so without
+     * this check a reel would "stay on screen" (and recording) after the user
+     * went home.
+     */
+    private val ticker = object : Runnable {
+        override fun run() {
+            val pkg = runCatching { rootInActiveWindow?.packageName?.toString() }.getOrNull()
+            // Null counts as "not ours" too: whether the platform filters the
+            // root by packageNames or just has no window yet, either way we
+            // can't see a reel. Three misses (~750 ms) so a transient null
+            // mid-transition does not end the reel.
+            offAppTicks = if (pkg != null && pkg in WATCHED) 0 else offAppTicks + 1
+            if (offAppTicks >= 3) {
+                lastVisibleTitle = null
+                noReel()
+            } else {
+                dispatch(tracker.tick(SystemClock.elapsedRealtime()))
+            }
+            if (tracker.currentKey != null) main.postDelayed(this, TICK_MS) else ticking = false
+        }
+    }
+
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val pkg = event?.packageName?.toString() ?: return
 
-        if (pkg == TIKTOK_PKG) { handleTikTok(); return }
-
-        if (pkg != YOUTUBE_PKG) return
+        when (pkg) {
+            in TIKTOK_PKGS -> { handleTikTok(); return }
+            INSTAGRAM_PKG -> { handleInstagram(); return }
+            YOUTUBE_PKG -> {}
+            else -> return
+        }
         val root = rootInActiveWindow ?: return
 
         val reel = findByIdSuffix(root, REEL_CONTAINER) ?: findByIdSuffix(root, REEL_RECYCLER)
         if (reel == null) {
-            if (currentKey != null || lastVisibleTitle != null) {
-                currentKey = null
+            if (tracker.currentKey != null || lastVisibleTitle != null) {
                 lastVisibleTitle = null
-                inFlight?.cancel()
-                Overlay.hide(this)
+                noReel()
             }
             return
         }
@@ -63,15 +100,14 @@ class ShortsAccessibilityService : AccessibilityService() {
         // mid-swipe, and every one of them used to leave the previous video's
         // verdict on screen -- so the badge showed stats for a Short the user
         // had already scrolled past, with nothing signalling it was stale.
+        // In v2 the same moment matters more: ending the reel here is what
+        // stops recording and drops the previous reel's buffer.
         val visible = pickTitles(labels).firstOrNull()
         if (visible != null && visible != lastVisibleTitle) {
             lastVisibleTitle = visible
             stuckSince = 0L
-            if (currentKey != null && !currentKey!!.endsWith("|$visible")) {
-                inFlight?.cancel()
-                currentKey = null
-                Overlay.showChecking(this, visible)
-            }
+            val cur = tracker.currentKey
+            if (cur != null && !cur.endsWith("|$visible")) noReel()
         }
         // trimEnd('.') matters: the label is a sentence ("Subscribe to
         // @BBCNews.") and the handle charset legitimately contains dots, so
@@ -83,40 +119,18 @@ class ShortsAccessibilityService : AccessibilityService() {
             }
             ?.trimEnd('.')
             ?.takeIf { it.isNotBlank() }
-            ?: run { giveUpIfStuck(); return }
+            ?: run { giveUpIfStuck(visible); return }
         val titles = pickTitles(labels)
-        if (titles.isEmpty()) { giveUpIfStuck(); return }
+        if (titles.isEmpty()) { giveUpIfStuck(null); return }
         val title = titles.first()
 
-        val key = "$handle|$title"
-        if (key == currentKey) return          // same Short, just another content-change event
-        currentKey = key
-
-        // The swipe is the cancel signal. Drop the previous request's UI
-        // immediately -- the server deliberately lets the old job finish and
-        // cache, so a swipe-back is instant rather than wasted.
-        inFlight?.cancel()
-        Log.i(TAG, "short: @$handle | $title")
-        Overlay.showChecking(this, title)
-
-        inFlight = scope.launch {
-            val result = runCatching { Api.check(titles, "@$handle") }
-                .getOrElse { CheckResult.Failed(it.javaClass.simpleName, true) }
-            withContext(Dispatchers.Main) {
-                val ctx = this@ShortsAccessibilityService
-                when (result) {
-                    is CheckResult.Ok -> Overlay.showVerdict(ctx, result.verdict)
-                    is CheckResult.Unknown -> Overlay.showUnknown(ctx, result.why)
-                    is CheckResult.Failed -> {
-                        Log.w(TAG, "check failed: ${result.detail}")
-                        // Hidden from users unless the server enables debug
-                        // badges -- an error glyph they can't act on is noise.
-                        if (result.showToUser) Overlay.showError(ctx, result.detail)
-                        else Overlay.showUnknown(ctx, "Couldn't check this one")
-                    }
-                }
-            }
+        // Same key again is just another content-change event; the tracker
+        // treats it as a tick. A new key is the swipe.
+        val key = "youtube|$handle|$title"
+        if (key != tracker.currentKey && !ReelTracker.sameReel(tracker.currentKey, key)) {
+            Log.i(TAG, "short: @$handle | $title")
         }
+        reel(key, ReelHints("youtube", titles, "@$handle"))
     }
 
     /**
@@ -131,7 +145,7 @@ class ShortsAccessibilityService : AccessibilityService() {
     private fun handleTikTok() {
         val root = rootInActiveWindow ?: return
         if (findByIdSuffix(root, TT_PAGER) == null && findByIdSuffix(root, TT_VIDEO) == null) {
-            if (currentKey != null) { currentKey = null; inFlight?.cancel(); Overlay.hide(this) }
+            noReel()
             return
         }
         val creator = findByIdSuffix(root, TT_CREATOR)?.let {
@@ -142,47 +156,114 @@ class ShortsAccessibilityService : AccessibilityService() {
         }?.trim().orEmpty()
         if (creator.isBlank() || caption.length < 10) return
 
-        val key = "tt|$creator|$caption"
-        if (key == currentKey) return
-        currentKey = key
-        inFlight?.cancel()
-        Log.i(TAG, "tiktok: $creator | $caption")
-        Overlay.showChecking(this, caption)
+        val key = "tiktok|$creator|$caption"
+        if (key != tracker.currentKey) Log.i(TAG, "tiktok: $creator | $caption")
+        reel(key, ReelHints("tiktok", listOf(caption), creator))
+    }
 
-        inFlight = scope.launch {
-            val result = runCatching { Api.check(listOf(caption), creator, "tiktok") }
-                .getOrElse { CheckResult.Failed(it.javaClass.simpleName, true) }
-            withContext(Dispatchers.Main) {
-                val ctx = this@ShortsAccessibilityService
-                when (result) {
-                    is CheckResult.Ok -> Overlay.showVerdict(ctx, result.verdict)
-                    is CheckResult.Unknown -> Overlay.showUnknown(ctx, result.why)
-                    is CheckResult.Failed -> {
-                        Log.w(TAG, "tiktok check failed: ${result.detail}")
-                        if (result.showToUser) Overlay.showError(ctx, result.detail)
-                        else Overlay.showUnknown(ctx, "Couldn't check this one")
-                    }
-                }
-            }
-        }
+    /**
+     * Instagram Reels. UNVERIFIED: none of this has been checked against a
+     * live Instagram view tree yet -- unlike the YouTube and TikTok paths
+     * above, which were built from device dumps. Everything here is a
+     * structural guess, kept deliberately conservative, plus a debug-only
+     * tree dump (BuildConfig.DUMP_VIEW_TREE) so the guesses can be replaced
+     * with measured ids on a real phone.
+     *
+     * Guesses, in order of confidence:
+     *  1. Instagram's internal name for Reels is "clips", so a resource id
+     *     containing `clips_viewer` / `clips_video` likely marks the player.
+     *     UNVERIFIED: the exact ids and whether they survive obfuscation.
+     *  2. Structural fallback: a scrollable pager/recycler covering ~the whole
+     *     window, with some visible label mentioning "Reel". UNVERIFIED.
+     *  3. Identity: an author node (id containing `username`) and a caption
+     *     node (id containing `caption`), else the longest non-chrome label
+     *     -- the same longest-wins rule that works for YouTube. UNVERIFIED.
+     */
+    private fun handleInstagram() {
+        val root = rootInActiveWindow ?: return
+        if (BuildConfig.DUMP_VIEW_TREE) dumpTree(root)
+
+        val container = findByIdContaining(root, IG_CONTAINER_HINTS) ?: findFullScreenPager(root)
+        if (container == null) { noReel(); return }
+        val labels = collectDescriptions(container)
+        // UNVERIFIED structural gate: a full-screen pager alone is also the
+        // feed and Stories, so require something that says "reel". Skipped
+        // when the id-based match hit, which is the stronger signal.
+        if (findByIdContaining(root, IG_CONTAINER_HINTS) == null &&
+            labels.none { it.contains("reel", ignoreCase = true) }) { noReel(); return }
+
+        val handle = (findByIdContaining(container, listOf("author_username", "username"))
+            ?.let { (it.text ?: it.contentDescription)?.toString() }
+            ?: labels.firstNotNullOfOrNull { IG_HANDLE.find(it)?.groupValues?.get(1) })
+            ?.trim()?.removePrefix("@")?.trim().orEmpty()
+        val caption = (findByIdContaining(container, listOf("caption"))
+            ?.let { (it.text ?: it.contentDescription)?.toString() }
+            ?: labels.filter { l -> IG_CHROME.none { it.containsMatchIn(l) } && l.length >= 12 }
+                .maxByOrNull { it.length })
+            ?.trim().orEmpty()
+        // Without a caption-ish string two reels by one author share a key,
+        // and a swipe between them would not register -- merging their audio.
+        // Better to not track at all than to do that.
+        if (caption.length < 10) return
+
+        val key = "instagram|$handle|$caption"
+        if (key != tracker.currentKey) Log.i(TAG, "instagram: $handle | $caption")
+        reel(key, ReelHints("instagram", listOf(caption), handle))
     }
 
     private var stuckSince = 0L
 
     /**
-     * A spinner with nothing behind it is worse than an honest blank. If we
-     * cannot identify the Short within a couple of seconds -- no handle node,
-     * no usable title -- say so instead of spinning indefinitely, which is
-     * what happened on channels lacking a "Subscribe to @x" label.
+     * If we cannot read the channel handle within a couple of seconds, fall
+     * back to a title-only key rather than not tracking at all. In v1 the
+     * handle was essential (it resolved the video); in v2 the captured audio
+     * is the content and the handle is only a cache hint. Without a title
+     * there is no stable identity, so a swipe could not be told apart from
+     * the same reel -- in that case we track nothing.
      */
-    private fun giveUpIfStuck() {
-        if (currentKey != null) return            // a check is genuinely running
-        val now = System.currentTimeMillis()
+    private fun giveUpIfStuck(title: String?) {
+        if (tracker.currentKey != null) return    // already tracking this reel
+        val now = SystemClock.elapsedRealtime()
         if (stuckSince == 0L) { stuckSince = now; return }
         if (now - stuckSince > 2500) {
             stuckSince = 0L
-            lastVisibleTitle = null
-            Overlay.showUnknown(this, "Couldn't identify this video")
+            if (title != null) reel("youtube||$title", ReelHints("youtube", listOf(title), ""))
+        }
+    }
+
+    // --- tracker plumbing --------------------------------------------------
+
+    private fun reel(key: String, hints: ReelHints) {
+        pendingHints = hints
+        offAppTicks = 0
+        dispatch(tracker.onReel(key, SystemClock.elapsedRealtime()))
+        // The tracker kept an older key for this same reel (a title-only key
+        // from giveUpIfStuck, now that the handle has rendered). Pass on the
+        // fuller hints without restarting the view.
+        tracker.currentKey?.let { cur -> if (cur != key && hints.channel.isNotBlank()) Uploader.updateHints(cur, hints) }
+        if (!ticking) { ticking = true; main.postDelayed(ticker, TICK_MS) }
+    }
+
+    private fun noReel() = dispatch(tracker.onNoReel(SystemClock.elapsedRealtime()))
+
+    private fun dispatch(events: List<ReelEvent>) {
+        for (e in events) when (e) {
+            is ReelEvent.Started -> {
+                // Recording starts here, but nothing is sent: the buffer stays
+                // in memory until DwellReached, and is dropped on Ended.
+                CaptureService.instance?.beginReel(e.key)
+                Uploader.begin(e.key, pendingHints ?: ReelHints(e.key.substringBefore('|'), emptyList(), ""))
+            }
+            is ReelEvent.DwellReached -> {
+                Uploader.uploadDue(e.key)
+                Overlay.showButton(this) { Uploader.onTap(this) }
+            }
+            is ReelEvent.ChunkDue -> Uploader.uploadDue(e.key)
+            is ReelEvent.Ended -> {
+                CaptureService.instance?.endReel()
+                Uploader.end(e.key)
+                Overlay.hide(this)
+            }
         }
     }
 
@@ -190,7 +271,9 @@ class ShortsAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         super.onDestroy()
-        scope.cancel()
+        main.removeCallbacks(ticker)
+        ticking = false
+        noReel()
         Overlay.hide(this)
     }
 
@@ -203,6 +286,58 @@ class ShortsAccessibilityService : AccessibilityService() {
             if (hit != null) return hit
         }
         return null
+    }
+
+    private fun findByIdContaining(node: AccessibilityNodeInfo, parts: List<String>): AccessibilityNodeInfo? {
+        node.viewIdResourceName?.let { id -> if (parts.any { id.contains(it) } && node.isVisibleToUser) return node }
+        for (i in 0 until node.childCount) {
+            val hit = node.getChild(i)?.let { findByIdContaining(it, parts) }
+            if (hit != null) return hit
+        }
+        return null
+    }
+
+    /** UNVERIFIED Instagram fallback: a scrollable pager covering >= 90% of the window. */
+    private fun findFullScreenPager(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val win = Rect().also(root::getBoundsInScreen)
+        if (win.isEmpty) return null
+        val b = Rect()
+        fun walk(n: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+            if (!n.isVisibleToUser) return null
+            val cls = n.className?.toString().orEmpty()
+            if (n.isScrollable && (cls.endsWith("ViewPager") || cls.endsWith("ViewPager2") ||
+                    cls.endsWith("RecyclerView"))) {
+                n.getBoundsInScreen(b)
+                if (b.width() >= win.width() * 0.9 && b.height() >= win.height() * 0.9) return n
+            }
+            for (i in 0 until n.childCount) n.getChild(i)?.let(::walk)?.let { return it }
+            return null
+        }
+        return walk(root)
+    }
+
+    /**
+     * Debug-only: log the Instagram view tree (ids, classes, labels, bounds)
+     * so the UNVERIFIED heuristics above can be replaced with what a real
+     * build exposes -- the same method that produced the YouTube findings.
+     * Throttled; a full dump on every content-change event floods logcat.
+     */
+    private fun dumpTree(root: AccessibilityNodeInfo) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastTreeDump < 3_000) return
+        lastTreeDump = now
+        val b = Rect()
+        fun walk(n: AccessibilityNodeInfo, depth: Int) {
+            if (depth > 40) return
+            n.getBoundsInScreen(b)
+            val label = (n.text ?: n.contentDescription)?.toString()?.replace('\n', ' ')?.take(80)
+            Log.d(TREE_TAG, "${"  ".repeat(depth)}${n.className?.toString()?.substringAfterLast('.')}" +
+                " id=${n.viewIdResourceName?.substringAfter(":id/")} vis=${n.isVisibleToUser}" +
+                " scroll=${n.isScrollable} $b" + (label?.let { " \"$it\"" } ?: ""))
+            for (i in 0 until n.childCount) n.getChild(i)?.let { walk(it, depth + 1) }
+        }
+        Log.d(TREE_TAG, "---- instagram tree ----")
+        walk(root, 0)
     }
 
     /**
@@ -218,9 +353,9 @@ class ShortsAccessibilityService : AccessibilityService() {
      * from the page occupying the screen.
      */
     private fun collectDescriptions(node: AccessibilityNodeInfo): List<String> {
-        val screen = android.graphics.Rect()
+        val screen = Rect()
         node.getBoundsInScreen(screen)
-        val bounds = android.graphics.Rect()
+        val bounds = Rect()
         val out = mutableListOf<String>()
 
         fun walk(n: AccessibilityNodeInfo) {
@@ -255,8 +390,27 @@ class ShortsAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val TAG = "ShortCheck"
+        private const val TREE_TAG = "ShortCheckTree"
+        private const val TICK_MS = 250L
         private const val YOUTUBE_PKG = "com.google.android.youtube"
-        private const val TIKTOK_PKG = "com.zhiliaoapp.musically"
+        // The TikTok ids below were measured on com.zhiliaoapp.musically.
+        // com.ss.android.ugc.trill is the same app built for other regions;
+        // that it exposes the same ids is UNVERIFIED.
+        private val TIKTOK_PKGS = setOf("com.zhiliaoapp.musically", "com.ss.android.ugc.trill")
+        private const val INSTAGRAM_PKG = "com.instagram.android"
+        private val WATCHED = TIKTOK_PKGS + YOUTUBE_PKG + INSTAGRAM_PKG
+
+        // UNVERIFIED Instagram heuristics; see handleInstagram().
+        private val IG_CONTAINER_HINTS = listOf("clips_viewer", "clips_video")
+        private val IG_HANDLE = Regex("""^@?([a-z0-9._]{2,30})$""")
+        private val IG_CHROME = listOf(
+            Regex("""^(Like|Comment|Share|Send|Save|More|Follow|Following|Reels|Audio|Remix)$""", RegexOption.IGNORE_CASE),
+            Regex("""^Original audio""", RegexOption.IGNORE_CASE),
+            Regex("""^Profile picture""", RegexOption.IGNORE_CASE),
+            Regex("""^Liked by """, RegexOption.IGNORE_CASE),
+            Regex("""^View all \d+ comments""", RegexOption.IGNORE_CASE),
+            Regex("""^\d[\d,.]*[KkMm]?$"""),
+        )
         private const val TT_PAGER = "id/viewpager"
         private const val TT_VIDEO = "id/long_press_layout"
         private const val TT_CREATOR = "id/title"

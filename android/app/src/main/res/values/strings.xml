@@ -1,5 +1,9 @@
 <resources>
     <string name="app_name">ShortCheck</string>
     <string name="service_label">ShortCheck fact-check overlay</string>
-    <string name="service_description">Reads the title of the YouTube Short on screen so it can be fact-checked. No screenshots, no audio, no other screen content.</string>
+    <string name="service_description">Detects when a YouTube Short, TikTok or Instagram Reel is on screen and reads its title and creator, so the audio check knows when to listen. When you tap ✱, the title and creator are sent to the ShortCheck server. In other apps it reads only which app is in front (its package name), to stop listening when you leave. No screenshots.</string>
+    <string name="a11y_disclosure_title">Before you turn on the ShortCheck service</string>
+    <string name="a11y_disclosure_body">ShortCheck uses Android\'s Accessibility service to see when a reel is playing. It is not an accessibility tool.\n\nWhat it reads:\n• In YouTube, TikTok and Instagram: the title or caption and the creator of the reel on screen.\n• In any other app: only which app is in front (its package name), so it can stop listening when you leave. Nothing else on screen.\n\nWhat leaves your phone:\n• Once you have watched a reel for 5 seconds (with audio check on): its audio, sent to the ShortCheck server, which has it transcribed by a third-party speech-to-text provider (Google Gemini by default).\n• When you tap ✱: the reel\'s title and creator, sent to the ShortCheck server to identify and fact-check the video.\n\nWhy: so ShortCheck can fact-check the reel you are watching when you ask it to. Audio from reels you swipe past in under 5 seconds never leaves the phone. The server does not save audio and drops transcripts after 10 minutes.\n\nYou can turn the service off at any time in Settings → Accessibility.</string>
+    <string name="a11y_disclosure_accept">Accept and open settings</string>
+    <string name="a11y_disclosure_decline">No thanks</string>
 </resources>

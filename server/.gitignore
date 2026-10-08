@@ -6,3 +6,8 @@ cookies.txt
 __pycache__/
 *.pyc
 out/
+
+# eval artefacts (also covered by out/ above; explicit so moving that rule cannot leak reports)
+eval/out/
+eval/samples/
+.pytest_cache/
