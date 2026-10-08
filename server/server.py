@@ -264,10 +264,39 @@ def _transcript_key(text: str) -> str:
     return "sha256:" + hashlib.sha256(grounding.normalise(text).encode()).hexdigest()
 
 
-def _v2_cached(key: str | None) -> dict[str, Any] | None:
+# Hint keys are client-supplied, so a hint-key hit alone proves nothing: a
+# client could send a viral reel's title with arbitrary audio and have that
+# verdict served to everyone who checks the real reel (cache poisoning). A hit
+# is served only when the requester's own audio says the same thing as the
+# audio the verdict was made from. Compared as hashed 4-word shingles, so the
+# cache holds no recoverable transcript, and Jaccard tolerates the word-level
+# drift between two ASR passes over the same reel.
+_SHINGLE_N = 4
+SAME_AUDIO_JACCARD = float(os.environ.get("SAME_AUDIO_JACCARD", "0.5"))
+
+
+def _shingles(text: str) -> frozenset[str]:
+    words = grounding.normalise(text).split()
+    if len(words) < _SHINGLE_N:
+        words = words + [""] * (_SHINGLE_N - len(words))
+    return frozenset(
+        hashlib.sha256(" ".join(words[i:i + _SHINGLE_N]).encode()).hexdigest()[:16]
+        for i in range(len(words) - _SHINGLE_N + 1))
+
+
+def _same_audio(a: frozenset[str], b: frozenset[str]) -> bool:
+    if not a or not b:
+        return False
+    return len(a & b) / len(a | b) >= SAME_AUDIO_JACCARD
+
+
+def _v2_cached(key: str | None, shingles: frozenset[str] | None = None) -> dict[str, Any] | None:
     if key and key in _v2_cache:
+        hit = _v2_cache[key]
+        if shingles is not None and not _same_audio(hit["shingles"], shingles):
+            return None
         _v2_cache.move_to_end(key)
-        return _v2_cache[key]
+        return hit
     return None
 
 
@@ -287,9 +316,10 @@ def _v2_pipeline(req: V2CheckRequest) -> V2CheckResponse:
         kw.setdefault("seconds", time.perf_counter() - t0)
         return V2CheckResponse(session_id=sid, **kw)
 
+    # No cache lookup before the audio is heard: the hint key is client-supplied
+    # (see _same_audio). The transcript is normally prefetched by tap time, so
+    # this costs little.
     hint_key = _hint_key(req.app, req.channel, titles)
-    if (c := _v2_cached(hint_key)) is not None:
-        return done(status="ok", cached=True, verdict=c["verdict"], queries=c["queries"])
 
     sess = sessions.get(sid)
     silent = sess is not None and sess.captured_silent
@@ -334,9 +364,11 @@ def _v2_pipeline(req: V2CheckRequest) -> V2CheckResponse:
         return done(status="no_transcript", detail="no speech in the audio")
     text = text[:MAX_TRANSCRIPT_CHARS]
 
-    key = hint_key or _transcript_key(text)
-    if (c := _v2_cached(key)) is not None:
-        return done(status="ok", cached=True, verdict=c["verdict"], queries=c["queries"])
+    shingles = _shingles(text)
+    tkey = _transcript_key(text)
+    for k in (tkey, hint_key):
+        if (c := _v2_cached(k, shingles)) is not None:
+            return done(status="ok", cached=True, verdict=c["verdict"], queries=c["queries"])
 
     left = max(req.deadline_s - (time.perf_counter() - t0), 2.0)
     r = factcheck.check(text, titles[0] if titles else "", req.channel, deadline_s=left)
@@ -346,8 +378,14 @@ def _v2_pipeline(req: V2CheckRequest) -> V2CheckResponse:
         _record_failure("agent_v2", " | ".join(titles[:3]), req.channel, None, r.error, None)
         return done(status="error", detail=r.error, queries=r.queries)
 
-    payload = {"verdict": r.verdict.model_dump(), "queries": r.queries}
-    _v2_store(key, payload)
+    payload = {"verdict": r.verdict.model_dump(), "queries": r.queries, "shingles": shingles}
+    _v2_store(tkey, payload)
+    # First writer keeps a hint key unless the new verdict is from the same
+    # audio: otherwise a client sending a viral reel's hints with other audio
+    # could evict the real entry, even though it can no longer be served it.
+    if hint_key and (hint_key not in _v2_cache
+                     or _same_audio(_v2_cache[hint_key]["shingles"], shingles)):
+        _v2_store(hint_key, payload)
     return done(status="ok", verdict=payload["verdict"], queries=r.queries)
 
 

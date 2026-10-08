@@ -12,6 +12,8 @@ from conftest import claim, make_wav, verdict
 SPEECH = {
     0: "Amazon made five hundred and seventy four billion dollars last year.",
     1: "And Apple sold over two hundred million iPhones.",
+    # A different reel's audio, used to impersonate the reel above.
+    2: "Vaccines contain microchips that track your location through five G towers.",
 }
 CHUNKS = {i: make_wav(0.2, dbfs=-20, freq=300 + 50 * i) for i in SPEECH}
 SILENT = make_wav(0.2, dbfs=None)
@@ -122,10 +124,46 @@ def test_second_check_with_same_hints_is_cached(client, fake_asr, fake_llm):
     assert check(client, "s1").json()["status"] == "ok"
     n = len(llm.calls)
 
-    # A different viewer, different session, same reel.
+    # A different viewer, different session, same reel: same audio, so served.
+    upload(client, "s2", 0, CHUNKS[0])
+    upload(client, "s2", 1, CHUNKS[1])
     j = check(client, "s2", titles=["BIG tech facts!"], channel="@techguy").json()
     assert j["status"] == "ok" and j["cached"]
     assert len(llm.calls) == n
+
+
+def test_hint_key_cannot_be_poisoned_with_other_audio(client, fake_asr, fake_llm):
+    llm = fake_llm(verdict(claim("Apple sold over two hundred million iPhones")))
+    upload(client, "s1", 0, CHUNKS[0])
+    upload(client, "s1", 1, CHUNKS[1])
+    first = check(client, "s1").json()["verdict"]
+
+    # An attacker claims the same title and channel but uploads other audio.
+    # They must not get the cached verdict, and must not overwrite the real
+    # reel's entry for the next viewer.
+    upload(client, "s3", 0, CHUNKS[2])
+    n = len(llm.calls)
+    j = check(client, "s3", final_seq=0).json()
+    assert not j["cached"]
+    assert len(llm.calls) > n
+
+    hint = server._hint_key("youtube", "Subscribe to @TechGuy.", ["Big Tech facts"])
+    assert server._v2_cache[hint]["verdict"] == first
+
+    upload(client, "s4", 0, CHUNKS[0])
+    upload(client, "s4", 1, CHUNKS[1])
+    j = check(client, "s4").json()
+    assert j["cached"] and j["verdict"] == first
+
+
+def test_no_cache_hit_before_audio_is_heard(client, fake_asr, fake_llm, fake_v1):
+    fake_llm(verdict(claim("Apple sold over two hundred million iPhones")))
+    upload(client, "s1", 0, CHUNKS[0])
+    upload(client, "s1", 1, CHUNKS[1])
+    check(client, "s1")
+    # Same hints, no audio at all: must not be answered from the hint cache.
+    j = check(client, "never-uploaded").json()
+    assert not j["cached"] and j["source"] == "v1_fallback"
 
 
 def test_without_hints_the_key_is_the_transcript_hash(client, fake_asr, fake_llm):
