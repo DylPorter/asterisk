@@ -272,7 +272,11 @@ def _transcript_key(text: str) -> str:
 # cache holds no recoverable transcript, and Jaccard tolerates the word-level
 # drift between two ASR passes over the same reel.
 _SHINGLE_N = 4
-SAME_AUDIO_JACCARD = float(os.environ.get("SAME_AUDIO_JACCARD", "0.5"))
+# 0.5 was too loose: the real reel's audio plus a few fabricated sentences
+# still cleared it, so whoever checked a new reel first could plant claims the
+# reel never made. 0.8 costs cache hits under ASR drift; _serves() below is
+# the real guard.
+SAME_AUDIO_JACCARD = float(os.environ.get("SAME_AUDIO_JACCARD", "0.8"))
 
 
 def _shingles(text: str) -> frozenset[str]:
@@ -288,6 +292,19 @@ def _same_audio(a: frozenset[str], b: frozenset[str]) -> bool:
     if not a or not b:
         return False
     return len(a & b) / len(a | b) >= SAME_AUDIO_JACCARD
+
+
+def _serves(verdict: dict[str, Any], text: str) -> bool:
+    """A cached verdict is served only if every claim is quoted in THIS audio.
+
+    Overlap alone cannot stop a first writer who padded the real audio with
+    fabricated sentences: their extra claims would ride along on a match.
+    Re-grounding against the requester's own transcript catches exactly those,
+    and any drop means the cached verdict is about audio this viewer did not
+    hear -- treat it as a miss and check fresh.
+    """
+    claims = verdict.get("claims") or []
+    return all(grounding.is_grounded(c.get("quote") or "", text) for c in claims)
 
 
 def _v2_cached(key: str | None, shingles: frozenset[str] | None = None) -> dict[str, Any] | None:
@@ -367,7 +384,7 @@ def _v2_pipeline(req: V2CheckRequest) -> V2CheckResponse:
     shingles = _shingles(text)
     tkey = _transcript_key(text)
     for k in (tkey, hint_key):
-        if (c := _v2_cached(k, shingles)) is not None:
+        if (c := _v2_cached(k, shingles)) is not None and _serves(c["verdict"], text):
             return done(status="ok", cached=True, verdict=c["verdict"], queries=c["queries"])
 
     left = max(req.deadline_s - (time.perf_counter() - t0), 2.0)

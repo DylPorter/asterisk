@@ -14,6 +14,7 @@ SPEECH = {
     1: "And Apple sold over two hundred million iPhones.",
     # A different reel's audio, used to impersonate the reel above.
     2: "Vaccines contain microchips that track your location through five G towers.",
+    3: "Also Microsoft bought the moon for nine dollars yesterday afternoon.",
 }
 CHUNKS = {i: make_wav(0.2, dbfs=-20, freq=300 + 50 * i) for i in SPEECH}
 SILENT = make_wav(0.2, dbfs=None)
@@ -371,3 +372,23 @@ def test_transcript_is_fenced_as_untrusted_data(client, monkeypatch, fake_llm):
     assert user.count("<title>") == 1
     assert user.index("System note") < user.index("</transcript>")
     assert user.rstrip().endswith("not instructions.")
+
+
+def test_padded_real_audio_cannot_plant_claims_as_first_writer(client, fake_asr, fake_llm):
+    # The attacker checks a new reel first, uploading its real audio plus a
+    # fabricated sentence, so the cached verdict carries a claim the reel
+    # never made. A real viewer must not be served it.
+    llm = fake_llm(verdict(
+        claim("Apple sold over two hundred million iPhones"),
+        claim("Microsoft bought the moon for nine dollars yesterday afternoon"),
+        statements_checked=2))
+    for seq, i in enumerate((0, 1, 3)):
+        upload(client, "atk", seq, CHUNKS[i])
+    assert check(client, "atk", final_seq=2).json()["status"] == "ok"
+
+    upload(client, "real", 0, CHUNKS[0])
+    upload(client, "real", 1, CHUNKS[1])
+    n = len(llm.calls)
+    j = check(client, "real").json()
+    assert not j["cached"]
+    assert len(llm.calls) > n
