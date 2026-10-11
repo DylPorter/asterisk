@@ -1,9 +1,32 @@
 """HTTP front end for the fact-check agent.
 
-The Android app sends exactly what its accessibility service can read -- the
-reel's content-desc title and the subscribe button's label -- and gets a badge
-back. Nothing else is transmitted: no screenshots, no audio, no screen content
-beyond the public title of a public video.
+Two paths, and they send different things. Stated exactly, because the
+difference matters:
+
+v1, POST /check -- the Android accessibility service sends what it can read
+off the screen: the reel's content-desc title and the subscribe button's
+label. No audio and no screenshots. The server finds the video by title,
+fetches its public captions, and caches the verdict by video ID in
+out/verdict_cache.json.
+
+v2, POST /v2/segments + POST /v2/check -- the app ALSO sends audio:
+  - What: the playback audio of the reel on screen, as 16 kHz mono PCM16 WAV
+    chunks of about 5 s. Captured only from the YouTube, TikTok and Instagram
+    apps' own playback (AudioPlaybackCaptureConfiguration), never the
+    microphone, never screen pixels.
+  - When: only after the reel has been on screen for 5 s. A reel swiped away
+    sooner uploads nothing; its buffer is discarded on the device.
+  - With it: the app name, a random per-reel-view session UUID and a chunk
+    number. At tap, /v2/check adds the same title/channel hints as v1.
+  - Where it goes: each chunk is forwarded to the ASR provider (Gemini by
+    default, see asr.py) to be transcribed. That is a third party seeing the
+    audio; nothing else does.
+  - What is kept: the audio is never written to disk and is not retained after
+    its transcription call returns. Transcripts are held in memory per session
+    and dropped 10 min after the session starts (sessions.py). v2 verdicts --
+    which include quotes of at most 25 words per claim -- are cached in memory
+    only, never in the on-disk cache, and v2 failures are logged without the
+    model's raw output so no transcript text reaches out/failures.jsonl.
 
 Run:
     ./.venv/bin/uvicorn server:app --host 0.0.0.0 --port 8000
@@ -15,19 +38,25 @@ tailnet, no tunnel, no ngrok, and it never leaves the private network.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
+import re
 import time
+from collections import OrderedDict
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 # yt-dlp needs a JS runtime for YouTube extraction; deno lives in ~/.deno.
 os.environ["PATH"] = os.path.expanduser("~/.deno/bin") + os.pathsep + os.environ.get("PATH", "")
 
+import asr
 import factcheck
+import grounding
+import sessions
 import transcript as tx
 
 app = FastAPI(title="shortcheck")
@@ -162,6 +191,280 @@ async def check(req: CheckRequest) -> CheckResponse:
     return res
 
 
+# --- v2: on-device capture -------------------------------------------------
+
+# 120 s of 16 kHz mono PCM16 is 3.84 MB -- the client's whole ring buffer. A
+# 5 s chunk is ~160 KB. Anything near the cap is a bug or abuse, not a reel.
+MAX_SEGMENT_BYTES = 4 * 1024 * 1024
+
+# How long /v2/check waits for chunks still being transcribed. The prefetch
+# means usually only the final partial chunk is outstanding at tap time.
+# Not measured yet -- a guess at one Gemini audio call; eval/ reports latency.
+TRANSCRIPT_WAIT_S = float(os.environ.get("TRANSCRIPT_WAIT_S", "8"))
+# Share of the client's deadline the transcript may take when NOTHING is
+# transcribed yet. The short wait above is right when earlier chunks are done
+# and only the tail is late -- a partial transcript still checks. With no text
+# at all, giving up at 8 s while an ASR call may legitimately take
+# asr.TIMEOUT_S (15) just turns a slow call into a wasted tap. 0.6 of the
+# phone's 25 s deadline is 15 s, leaving 10 s for the fact-check.
+EMPTY_WAIT_SHARE = 0.6
+
+# Character budget for the transcript sent to the LLM. ~12k chars is roughly
+# 2,000 words, far more than the MAX_SEQ chunks of speech a reel produces,
+# so a real reel never hits it; it caps the prompt (and the bill) if
+# something upstream misbehaves. Grounding sees the same truncated text, so a
+# quote from the cut part is dropped rather than half-checked.
+MAX_TRANSCRIPT_CHARS = 12_000
+
+_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_APP = re.compile(r"^[a-z]{1,20}$")
+
+# v2 verdicts stay in memory. They carry transcript quotes, and the privacy
+# constraint is that transcripts are not persisted -- so they never go into
+# CACHE_FILE. Bounded so a long-running server cannot grow without limit.
+_V2_CACHE_MAX = 2000
+_v2_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
+
+
+class V2CheckRequest(BaseModel):
+    session_id: str
+    app: str = "youtube"        # "youtube" | "tiktok" | "instagram"
+    titles: list[str] = []
+    channel: str = ""
+    final_seq: int = -1         # last chunk the client uploaded; -1 = none
+    deadline_s: float = 20.0
+
+
+class V2CheckResponse(CheckResponse):
+    # v1's status vocabulary (ok | no_transcript | error) plus one:
+    # "captured_silent" -- the app blocked capture and there is no v1 route.
+    # Kept distinct from no_transcript, which the phone renders as "No speech
+    # in this video"; that would be false for a reel we simply could not hear.
+    session_id: str | None = None
+    source: str = "audio"       # "audio" | "v1_fallback"
+    captured_silent: bool = False
+
+
+def _hint_key(app_name: str, channel: str, titles: list[str]) -> str | None:
+    """`app|channel|normalised title`, or None without a title.
+
+    Caveat carried over from v1: titles[0] is a heuristic pick from the
+    accessibility tree and has been a search-suggestion chip before. Two reels
+    from one channel that both got a generic chip would share a key. The
+    transcript-hash key below has no such failure; it only misses more often.
+    """
+    title = grounding.normalise(titles[0]) if titles else ""
+    if not title:
+        return None
+    handle = tx.handle_from_subscribe_label(channel) or channel
+    return f"{app_name}|{handle.strip().casefold()}|{title}"
+
+
+def _transcript_key(text: str) -> str:
+    return "sha256:" + hashlib.sha256(grounding.normalise(text).encode()).hexdigest()
+
+
+# Hint keys are client-supplied, so a hint-key hit alone proves nothing: a
+# client could send a viral reel's title with arbitrary audio and have that
+# verdict served to everyone who checks the real reel (cache poisoning). A hit
+# is served only when the requester's own audio says the same thing as the
+# audio the verdict was made from. Compared as hashed 4-word shingles, so the
+# cache holds no recoverable transcript, and Jaccard tolerates the word-level
+# drift between two ASR passes over the same reel.
+_SHINGLE_N = 4
+# 0.5 was too loose: the real reel's audio plus a few fabricated sentences
+# still cleared it, so whoever checked a new reel first could plant claims the
+# reel never made. 0.8 costs cache hits under ASR drift; _serves() below is
+# the real guard.
+SAME_AUDIO_JACCARD = float(os.environ.get("SAME_AUDIO_JACCARD", "0.8"))
+
+
+def _shingles(text: str) -> frozenset[str]:
+    words = grounding.normalise(text).split()
+    if len(words) < _SHINGLE_N:
+        words = words + [""] * (_SHINGLE_N - len(words))
+    return frozenset(
+        hashlib.sha256(" ".join(words[i:i + _SHINGLE_N]).encode()).hexdigest()[:16]
+        for i in range(len(words) - _SHINGLE_N + 1))
+
+
+def _same_audio(a: frozenset[str], b: frozenset[str]) -> bool:
+    if not a or not b:
+        return False
+    return len(a & b) / len(a | b) >= SAME_AUDIO_JACCARD
+
+
+def _serves(verdict: dict[str, Any], text: str) -> bool:
+    """A cached verdict is served only if every claim is quoted in THIS audio.
+
+    Overlap alone cannot stop a first writer who padded the real audio with
+    fabricated sentences: their extra claims would ride along on a match.
+    Re-grounding against the requester's own transcript catches exactly those,
+    and any drop means the cached verdict is about audio this viewer did not
+    hear -- treat it as a miss and check fresh.
+    """
+    claims = verdict.get("claims") or []
+    return all(grounding.is_grounded(c.get("quote") or "", text) for c in claims)
+
+
+def _v2_cached(key: str | None, shingles: frozenset[str] | None = None) -> dict[str, Any] | None:
+    if key and key in _v2_cache:
+        hit = _v2_cache[key]
+        if shingles is not None and not _same_audio(hit["shingles"], shingles):
+            return None
+        _v2_cache.move_to_end(key)
+        return hit
+    return None
+
+
+def _v2_store(key: str, payload: dict[str, Any]) -> None:
+    _v2_cache[key] = payload
+    _v2_cache.move_to_end(key)
+    while len(_v2_cache) > _V2_CACHE_MAX:
+        _v2_cache.popitem(last=False)
+
+
+def _v2_pipeline(req: V2CheckRequest) -> V2CheckResponse:
+    t0 = time.perf_counter()
+    sid = req.session_id
+    titles = [t for t in req.titles if t and t.strip()]
+
+    def done(**kw: Any) -> V2CheckResponse:
+        kw.setdefault("seconds", time.perf_counter() - t0)
+        return V2CheckResponse(session_id=sid, **kw)
+
+    # No cache lookup before the audio is heard: the hint key is client-supplied
+    # (see _same_audio). The transcript is normally prefetched by tap time, so
+    # this costs little.
+    hint_key = _hint_key(req.app, req.channel, titles)
+
+    sess = sessions.get(sid)
+    silent = sess is not None and sess.captured_silent
+    if sess is None or silent:
+        # Silent means the app opted out of playback capture. YouTube still
+        # has the v1 route (title -> captions); the others have nothing to
+        # check. An unknown session (expired, or every upload lost) is
+        # treated the same way: for YouTube v1 is still the best answer.
+        if req.app == "youtube":
+            r = _pipeline(titles, req.channel, req.deadline_s, "youtube")
+            return done(**{**r.model_dump(), "seconds": time.perf_counter() - t0},
+                        source="v1_fallback", captured_silent=silent)
+        if silent:
+            return done(status="captured_silent", captured_silent=True,
+                        detail="can't check this video: the app blocks audio capture")
+        return done(status="error", detail="unknown or expired session")
+
+    sessions.set_hints(sid, titles=titles, channel=req.channel)
+    wait = min(TRANSCRIPT_WAIT_S, req.deadline_s * 0.4)
+    try:
+        text = sessions.transcript(sid, req.final_seq, wait)
+        if not text.strip() and sessions.outstanding(sid, req.final_seq):
+            # Nothing usable yet and something is still in flight: a partial
+            # transcript is not an option, so spend more of the deadline
+            # rather than give up on a call that has not had its full time.
+            extra = min(asr.TIMEOUT_S, req.deadline_s * EMPTY_WAIT_SHARE) - wait
+            if extra > 0:
+                text = sessions.transcript(sid, req.final_seq, extra)
+        pending = sessions.outstanding(sid, req.final_seq)
+    except KeyError:
+        return done(status="error", detail="unknown or expired session")
+
+    if not text.strip():
+        failed = [s.error for s in sess.segments.values() if s.state == sessions.FAILED]
+        if failed:
+            return done(status="error", detail=f"transcription failed: {failed[-1]}")
+        if pending:
+            # Timed out, not empty. "No speech in this video" would be a
+            # false statement about a video we simply had not heard yet.
+            return done(status="error", detail="still transcribing; try again")
+        # Capture worked but nobody spoke: music, ambience, a silent clip.
+        return done(status="no_transcript", detail="no speech in the audio")
+    text = text[:MAX_TRANSCRIPT_CHARS]
+
+    shingles = _shingles(text)
+    tkey = _transcript_key(text)
+    for k in (tkey, hint_key):
+        if (c := _v2_cached(k, shingles)) is not None and _serves(c["verdict"], text):
+            return done(status="ok", cached=True, verdict=c["verdict"], queries=c["queries"])
+
+    left = max(req.deadline_s - (time.perf_counter() - t0), 2.0)
+    r = factcheck.check(text, titles[0] if titles else "", req.channel, deadline_s=left)
+    if not r.verdict:
+        # raw=None: the model's raw output quotes the transcript, and the
+        # failure log is on disk.
+        _record_failure("agent_v2", " | ".join(titles[:3]), req.channel, None, r.error, None)
+        return done(status="error", detail=r.error, queries=r.queries)
+
+    payload = {"verdict": r.verdict.model_dump(), "queries": r.queries, "shingles": shingles}
+    _v2_store(tkey, payload)
+    # First writer keeps a hint key unless the new verdict is from the same
+    # audio: otherwise a client sending a viral reel's hints with other audio
+    # could evict the real entry, even though it can no longer be served it.
+    if hint_key and (hint_key not in _v2_cache
+                     or _same_audio(_v2_cache[hint_key]["shingles"], shingles)):
+        _v2_store(hint_key, payload)
+    return done(status="ok", verdict=payload["verdict"], queries=r.queries)
+
+
+@app.post("/v2/segments")
+async def v2_segments(
+    request: Request,
+    session_id: str,
+    seq: int = Query(ge=0, le=sessions.MAX_SEQ),
+    app_name: str = Query(alias="app"),
+) -> dict[str, Any]:
+    """One ~5 s WAV chunk of a reel past the dwell gate. Transcribed in the background."""
+    if not _ID.match(session_id):
+        raise HTTPException(400, "bad session_id")
+    if not _APP.match(app_name):
+        raise HTTPException(400, "bad app")
+    # Enforced while reading, not after: request.body() buffers the whole
+    # upload first, and neither uvicorn nor Starlette caps body size, so a
+    # check on len(body) would run only after a multi-GB body was in RAM.
+    # Content-Length is refused up front; the running total catches chunked
+    # uploads that send none, or a header that lies.
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            if int(declared) > MAX_SEGMENT_BYTES:
+                raise HTTPException(413, "segment too large")
+        except ValueError:
+            raise HTTPException(400, "bad content-length")
+    buf = bytearray()
+    async for part in request.stream():
+        buf += part
+        if len(buf) > MAX_SEGMENT_BYTES:
+            raise HTTPException(413, "segment too large")
+    body = bytes(buf)
+    try:
+        # The RMS pass over ~80k samples is pure Python; keep it off the loop.
+        state = await run_in_threadpool(sessions.add_segment, session_id, seq, app_name, body)
+    except sessions.Busy as e:
+        # The client retries a failed upload once and then reuses the seq on
+        # its next chunk, so a 503 delays a chunk rather than losing the reel.
+        raise HTTPException(503, str(e), headers={"Retry-After": "5"})
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "session_id": session_id, "seq": seq, "state": state}
+
+
+@app.post("/v2/check", response_model=V2CheckResponse)
+async def v2_check(req: V2CheckRequest) -> V2CheckResponse:
+    """The tap. Waits for any chunk still transcribing, then fact-checks.
+
+    Like /check, not cancelled on client disconnect: the verdict still lands
+    in the cache.
+    """
+    if not _ID.match(req.session_id):
+        raise HTTPException(400, "bad session_id")
+    res = await run_in_threadpool(_v2_pipeline, req)
+    print(f"[v2]    {res.status:<14} {req.app:<9} {req.channel:<20} src={res.source} "
+          f"silent={res.captured_silent} {res.seconds:.1f}s {res.detail or ''}", flush=True)
+    return res
+
+
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    return {"ok": True, "model": factcheck.MODEL, "cached_videos": len(_cache)}
+    return {"ok": True, "model": factcheck.MODEL, "cached_videos": len(_cache),
+            "asr": asr.PROVIDER, "sessions": len(sessions.store),
+            "v2_cached": len(_v2_cache)}

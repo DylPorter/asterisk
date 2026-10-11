@@ -19,7 +19,12 @@ import android.widget.TextView
 import kotlin.math.abs
 
 /**
- * A draggable score puck that expands into a detail card.
+ * A draggable puck that walks through hidden -> ✱ button -> checking ->
+ * verdict card, and expands into a detail card.
+ *
+ * v1 showed a badge for every Short automatically. v2 checks nothing until the
+ * user taps: the ✱ only appears once the reel has passed the dwell gate, and
+ * the tap is what sends it to the fact-checker.
  *
  * The window is deliberately two different sizes. Collapsed it is a ~56dp box,
  * because a touchable overlay any larger would swallow the vertical swipe that
@@ -38,6 +43,9 @@ object Overlay {
     private var lp: WindowManager.LayoutParams? = null
     private var expanded = false
     private var last: Verdict? = null
+
+    /** Set while the puck is the ✱ "tap to check" button; consumed by one tap. */
+    private var onTap: (() -> Unit)? = null
 
     private var posX = -1
     private var posY = -1
@@ -62,6 +70,7 @@ object Overlay {
     }
 
     private val CHECKING = Tier("✳", 0xFF455A64.toInt(), "Checking")
+    private val TAP = Tier("✱", 0xFF1F6FEB.toInt(), "Tap to check")
     private val UNKNOWN = Tier("?", 0xFF6B7A86.toInt(), "Can't check")
     private val BROKEN = Tier("⚡", 0xFF8E44AD.toInt(), "Error")
 
@@ -175,7 +184,16 @@ object Overlay {
                 }
                 // A drag must not also register as a tap, or the card opens
                 // every time the badge is repositioned.
-                MotionEvent.ACTION_UP -> { if (!dragged) expand(ctx); true }
+                // While it is the ✱ button, a tap starts the check instead of
+                // opening a card (there is no card yet). Consumed once, so a
+                // double tap cannot fire two checks.
+                MotionEvent.ACTION_UP -> {
+                    if (!dragged) {
+                        val tap = onTap
+                        if (tap != null && last == null) { onTap = null; tap() } else expand(ctx)
+                    }
+                    true
+                }
                 else -> false
             }
         }
@@ -366,8 +384,18 @@ object Overlay {
         claims = emptyList(), skipped = 0, cached = false, seconds = 0.0,
     )
 
+    /** The reel passed the dwell gate: offer the check, don't run it. */
+    fun showButton(ctx: Context, tap: () -> Unit) {
+        if (expanded) collapse(ctx)
+        last = null
+        onTap = tap
+        stopSpin()
+        renderPuck(ctx, TAP)
+    }
+
     fun showChecking(ctx: Context, title: String) {
         if (expanded) collapse(ctx)
+        onTap = null
         last = null                       // nothing to expand into yet
         renderPuck(ctx, CHECKING)
         spin()
@@ -390,19 +418,29 @@ object Overlay {
         puck?.apply { animate().cancel(); clearAnimation(); rotation = 0f }
     }
 
-    fun showUnknown(ctx: Context, why: String) {
+    /**
+     * `open` = expand straight into the card. The v2 flow passes true: the
+     * user just tapped and is waiting for exactly this answer, so making them
+     * tap a second time to read it would be friction with no purpose.
+     */
+    fun showUnknown(ctx: Context, why: String, open: Boolean = false) {
+        onTap = null
         last = stub("unverifiable", why)
         stopSpin()
         renderPuck(ctx, UNKNOWN)
+        if (open) expand(ctx)
     }
 
-    fun showError(ctx: Context, detail: String) {
+    fun showError(ctx: Context, detail: String, open: Boolean = false) {
+        onTap = null
         last = stub("error", detail)
         stopSpin()
         renderPuck(ctx, BROKEN)
+        if (open) expand(ctx)
     }
 
-    fun showVerdict(ctx: Context, v: Verdict) {
+    fun showVerdict(ctx: Context, v: Verdict, open: Boolean = false) {
+        onTap = null
         stopSpin()
         // "Nothing was checkable" is not a score. The server encodes that case
         // as score=3 + overall=unverifiable, and score 3 is also tier "Mixed"
@@ -420,15 +458,17 @@ object Overlay {
         if (noFinding) {
             last = stub("unverifiable", "Nothing factual to check in this one")
             renderPuck(ctx, UNKNOWN)
+            if (open) expand(ctx)
             return
         }
         last = v
         renderPuck(ctx, tier(v.score))
+        if (open) expand(ctx)
     }
 
     fun hide(ctx: Context) {
         host?.let { runCatching { wm(ctx).removeView(it) } }
         host = null; puck = null; scrim = null; card = null; cardBody = null; lp = null
-        expanded = false; last = null
+        expanded = false; last = null; onTap = null
     }
 }

@@ -1,0 +1,29 @@
+[
+  {
+    "file": "samples/youtube_EXAMPLEID01.wav",
+    "app": "youtube",
+    "url": "https://www.youtube.com/shorts/EXAMPLEID01",
+    "title": "Title as the Shorts overlay shows it",
+    "channel": "@examplechannel",
+    "topic": "health",
+    "expected": "Claims cold water burns belly fat; should come back misleading/contradicted."
+  },
+  {
+    "file": "samples/instagram_EXAMPLE02.wav",
+    "app": "instagram",
+    "url": "https://www.instagram.com/reel/EXAMPLE02/",
+    "title": "",
+    "channel": "",
+    "topic": "finance",
+    "expected": "Correct summary of a central-bank rate decision; should be clear."
+  },
+  {
+    "file": "samples/tiktok_7000000000000000003.wav",
+    "app": "tiktok",
+    "url": "https://www.tiktok.com/@example/video/7000000000000000003",
+    "title": "Caption text",
+    "channel": "@example",
+    "topic": "news",
+    "expected": "Mixed: real event, wrong casualty figure; should be caution."
+  }
+]
