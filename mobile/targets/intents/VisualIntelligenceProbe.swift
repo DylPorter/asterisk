@@ -40,3 +40,21 @@ struct ScreenshotValueQuery: IntentValueQuery {
         return [ScreenCheckEntity(id: UUID().uuidString)]
     }
 }
+
+/// Visual search results must be openable (the metadata processor refuses the
+/// build otherwise). Tapping the result opens Asterisk; the real flow would
+/// carry the screenshot through to a check from there.
+struct OpenScreenCheck: OpenIntent {
+    static let title: LocalizedStringResource = "Fact-check with Asterisk"
+    @Parameter(title: "Check") var target: ScreenCheckEntity
+
+    init() {}
+    init(target: ScreenCheckEntity) { self.target = target }
+
+    func perform() async throws -> some IntentResult {
+        let url = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: Shared.appGroup)?
+            .appendingPathComponent("diag-intent.jsonl")
+        url.map { DiagLog(url: $0) }?.write("vi_open", ["id": target.id])
+        return .result()
+    }
+}
