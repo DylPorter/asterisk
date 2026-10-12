@@ -208,6 +208,14 @@ final class PipelineTests: XCTestCase {
         await fulfillment(of: [first], timeout: 5)
     }
 
+    func testServerCannotOpenThePrivacyGate() throws {
+        let c = try JSONDecoder().decode(CaptureConfig.self, from: Data(#"{"dwellMs": 0, "prefetch": true, "ringSeconds": 100000}"#.utf8))
+        XCTAssertEqual(c.dwellMs, CaptureConfig.minDwellMs)
+        XCTAssertFalse(c.prefetch)
+        XCTAssertEqual(c.ringSeconds, 120)
+        XCTAssertTrue(c.applying(userPrefetch: true).prefetch)
+    }
+
     func testConfigDecodingIsLenient() throws {
         let c = try JSONDecoder().decode(CaptureConfig.self, from: Data(#"{"dwellMs": 3000, "gridW": "oops", "extra": 1}"#.utf8))
         XCTAssertEqual(c.dwellMs, 3_000)

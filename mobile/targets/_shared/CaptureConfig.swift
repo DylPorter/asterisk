@@ -3,6 +3,10 @@ import Foundation
 /// Every tunable the extension uses, fetched from `GET /v2/config` at
 /// broadcast start so a wrong guess costs a server restart, not an EAS build.
 /// Decoding is lenient: a missing or malformed field keeps its default.
+///
+/// The server is not trusted with the privacy gate. Whatever it sends,
+/// `dwellMs` and the buffer bounds are clamped here, and `prefetch` is never
+/// decoded at all: it comes only from the user's own setting on the phone.
 public struct CaptureConfig: Codable, Equatable, Sendable {
     public var dwellMs: Int64 = 5_000
     public var chunkMs: Int64 = 5_000
@@ -11,7 +15,10 @@ public struct CaptureConfig: Codable, Equatable, Sendable {
     /// iOS cannot restrict capture to the three video apps the way Android's
     /// addMatchingUid does, so with this on, any app's audio that plays for
     /// 5 s while broadcasting is transcribed. Off = upload only on tap.
+    /// Local only -- see `applying(userPrefetch:)`; never read from the server.
     public var prefetch = false
+
+    public static let minDwellMs: Int64 = 3_000
     public var silentDb = -55.0
     public var frameIntervalMs: Int64 = 250
     public var strip = Region(x: 0.0, y: 0.70, w: 0.72, h: 0.18)
@@ -28,14 +35,21 @@ public struct CaptureConfig: Codable, Equatable, Sendable {
 
     public init() {}
 
+    /// The user's own choice, stored on the phone.
+    public func applying(userPrefetch: Bool) -> CaptureConfig {
+        var c = self
+        c.prefetch = userPrefetch
+        return c
+    }
+
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let d = CaptureConfig()
         func v<T: Decodable>(_ k: CodingKeys, _ def: T) -> T { (try? c.decodeIfPresent(T.self, forKey: k)) ?? def }
-        dwellMs = v(.dwellMs, d.dwellMs)
-        chunkMs = v(.chunkMs, d.chunkMs)
-        ringSeconds = v(.ringSeconds, d.ringSeconds)
-        prefetch = v(.prefetch, d.prefetch)
+        dwellMs = min(60_000, max(Self.minDwellMs, v(.dwellMs, d.dwellMs)))
+        chunkMs = min(15_000, max(2_000, v(.chunkMs, d.chunkMs)))
+        ringSeconds = min(120, max(10, v(.ringSeconds, d.ringSeconds)))
+        prefetch = false
         silentDb = v(.silentDb, d.silentDb)
         frameIntervalMs = v(.frameIntervalMs, d.frameIntervalMs)
         strip = v(.strip, d.strip)
