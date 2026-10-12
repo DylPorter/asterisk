@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -392,3 +394,33 @@ def test_padded_real_audio_cannot_plant_claims_as_first_writer(client, fake_asr,
     j = check(client, "real").json()
     assert not j["cached"]
     assert len(llm.calls) > n
+
+
+# --- iOS test-build endpoints ------------------------------------------------
+
+def test_ios_config_defaults_to_empty(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "IOS_CONFIG_FILE", str(tmp_path / "none.json"))
+    assert client.get("/v2/config").json() == {}
+
+
+def test_ios_config_served_from_file(client, tmp_path, monkeypatch):
+    p = tmp_path / "c.json"
+    p.write_text('{"changeThreshold": 0.1}')
+    monkeypatch.setattr(server, "IOS_CONFIG_FILE", str(p))
+    assert client.get("/v2/config").json() == {"changeThreshold": 0.1}
+
+
+def test_diag_appends_capped_lines(client, tmp_path, monkeypatch):
+    f = tmp_path / "diag.jsonl"
+    monkeypatch.setattr(server, "DIAG_FILE", str(f))
+    r = client.post("/v2/diag", json={"source": "broadcast", "lines": ['{"ev":"x"}', "y" * 5000]})
+    assert r.status_code == 200 and r.json()["n"] == 2
+    rows = [json.loads(l) for l in f.read_text().splitlines()]
+    assert rows[0]["src"] == "broadcast" and rows[0]["line"] == '{"ev":"x"}'
+    assert len(rows[1]["line"]) == server.DIAG_MAX_LINE
+
+
+def test_diag_rejects_oversized_batches_and_bad_source(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "DIAG_FILE", str(tmp_path / "d.jsonl"))
+    assert client.post("/v2/diag", json={"source": "b", "lines": ["x"] * 501}).status_code == 422
+    assert client.post("/v2/diag", json={"source": "../etc", "lines": []}).status_code == 400
