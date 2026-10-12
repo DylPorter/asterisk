@@ -216,6 +216,25 @@ final class PipelineTests: XCTestCase {
         XCTAssertTrue(c.applying(userPrefetch: true).prefetch)
     }
 
+    func testHostileGeometryIsClampedAndSafe() throws {
+        let c = try JSONDecoder().decode(CaptureConfig.self, from: Data(#"{"strip":{"x":-5,"y":3,"w":100,"h":-1},"gridW":100000,"gridH":0,"pixelStride":0,"bright":999,"changeThreshold":-2}"#.utf8))
+        XCTAssertLessThanOrEqual(c.gridW, 64)
+        XCTAssertEqual(c.gridH, 1)
+        XCTAssertEqual(c.pixelStride, 1)
+        XCTAssertEqual(c.bright, 255)
+        XCTAssertEqual(c.changeThreshold, 0)
+        XCTAssertGreaterThanOrEqual(c.strip.x, 0)
+        XCTAssertLessThanOrEqual(c.strip.y + c.strip.h, 1.0001)
+        XCTAssertLessThanOrEqual(c.strip.x + c.strip.w, 1.0001)
+        // And the signature builder survives a hostile region even unclamped.
+        let px = [UInt8](repeating: 255, count: 120 * 240)
+        let sig = px.withUnsafeBytes {
+            StripSignature.from(luma: $0, width: 120, height: 240, bytesPerRow: 120,
+                                region: Region(x: -3, y: -3, w: 9, h: 9), gridW: 4, gridH: 0, bright: 200)
+        }
+        XCTAssertEqual(sig.cells.count, 4)
+    }
+
     func testConfigDecodingIsLenient() throws {
         let c = try JSONDecoder().decode(CaptureConfig.self, from: Data(#"{"dwellMs": 3000, "gridW": "oops", "extra": 1}"#.utf8))
         XCTAssertEqual(c.dwellMs, 3_000)

@@ -4,7 +4,9 @@ import Foundation
 /// broadcast start so a wrong guess costs a server restart, not an EAS build.
 /// Decoding is lenient: a missing or malformed field keeps its default.
 ///
-/// The server is not trusted with the privacy gate. Whatever it sends,
+/// The server is not trusted. Every numeric field is clamped to a safe range,
+/// since the strip region and grid drive pixel indexing in the extension.
+/// Nor is it trusted with the privacy gate. Whatever it sends,
 /// `dwellMs` and the buffer bounds are clamped here, and `prefetch` is never
 /// decoded at all: it comes only from the user's own setting on the phone.
 public struct CaptureConfig: Codable, Equatable, Sendable {
@@ -35,6 +37,8 @@ public struct CaptureConfig: Codable, Equatable, Sendable {
 
     public init() {}
 
+    private static func unit(_ x: Float, _ def: Float) -> Float { x.isFinite ? min(1, max(0, x)) : def }
+
     /// The user's own choice, stored on the phone.
     public func applying(userPrefetch: Bool) -> CaptureConfig {
         var c = self
@@ -50,17 +54,18 @@ public struct CaptureConfig: Codable, Equatable, Sendable {
         chunkMs = min(15_000, max(2_000, v(.chunkMs, d.chunkMs)))
         ringSeconds = min(120, max(10, v(.ringSeconds, d.ringSeconds)))
         prefetch = false
-        silentDb = v(.silentDb, d.silentDb)
-        frameIntervalMs = v(.frameIntervalMs, d.frameIntervalMs)
-        strip = v(.strip, d.strip)
-        gridW = v(.gridW, d.gridW)
-        gridH = v(.gridH, d.gridH)
-        bright = v(.bright, d.bright)
-        pixelStride = v(.pixelStride, d.pixelStride)
-        changeThreshold = v(.changeThreshold, d.changeThreshold)
-        stableThreshold = v(.stableThreshold, d.stableThreshold)
-        stableFrames = v(.stableFrames, d.stableFrames)
-        deadlineS = v(.deadlineS, d.deadlineS)
-        diagEveryFrames = v(.diagEveryFrames, d.diagEveryFrames)
+        silentDb = min(0, max(-120, v(.silentDb, d.silentDb)))
+        frameIntervalMs = min(2_000, max(50, v(.frameIntervalMs, d.frameIntervalMs)))
+        strip = v(.strip, d.strip).clamped()
+        // Grid and stride bound the per-frame work and allocation in a 50 MB process.
+        gridW = min(64, max(1, v(.gridW, d.gridW)))
+        gridH = min(32, max(1, v(.gridH, d.gridH)))
+        bright = min(255, max(0, v(.bright, d.bright)))
+        pixelStride = min(32, max(1, v(.pixelStride, d.pixelStride)))
+        changeThreshold = Self.unit(v(.changeThreshold, d.changeThreshold), d.changeThreshold)
+        stableThreshold = Self.unit(v(.stableThreshold, d.stableThreshold), d.stableThreshold)
+        stableFrames = min(30, max(1, v(.stableFrames, d.stableFrames)))
+        deadlineS = min(60, max(5, v(.deadlineS, d.deadlineS)))
+        diagEveryFrames = min(1_000, max(0, v(.diagEveryFrames, d.diagEveryFrames)))
     }
 }

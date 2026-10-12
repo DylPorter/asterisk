@@ -27,6 +27,8 @@ public struct StripSignature: Equatable, Sendable {
         luma: UnsafeRawBufferPointer, width: Int, height: Int, bytesPerRow: Int,
         region: Region, gridW: Int, gridH: Int, bright: UInt8, stride: Int = 4
     ) -> StripSignature {
+        let gridW = max(1, gridW), gridH = max(1, gridH)
+        let region = region.clamped()
         let x0 = Int(Double(width) * region.x), y0 = Int(Double(height) * region.y)
         let rw = max(1, Int(Double(width) * region.w)), rh = max(1, Int(Double(height) * region.h))
         let st = max(1, stride)
@@ -41,7 +43,8 @@ public struct StripSignature: Equatable, Sendable {
                     var x = cx0
                     while x < min(cx1, width) {
                         let i = y * bytesPerRow + x
-                        if i < luma.count { if luma[i] >= bright { hit += 1 }; n += 1 }
+                        // UnsafeRawBufferPointer is unchecked in release builds; check both ends.
+                        if i >= 0, i < luma.count { if luma[i] >= bright { hit += 1 }; n += 1 }
                         x += st
                     }
                     y += st
@@ -56,6 +59,15 @@ public struct StripSignature: Equatable, Sendable {
 public struct Region: Codable, Equatable, Sendable {
     public var x: Double, y: Double, w: Double, h: Double
     public init(x: Double, y: Double, w: Double, h: Double) { self.x = x; self.y = y; self.w = w; self.h = h }
+
+    /// Inside the unit square with a non-zero area; non-finite input falls back to the whole frame.
+    public func clamped() -> Region {
+        func f(_ v: Double, _ def: Double) -> Double { v.isFinite ? min(1, max(0, v)) : def }
+        let cx = f(x, 0), cy = f(y, 0)
+        return Region(x: min(cx, 0.99), y: min(cy, 0.99),
+                      w: max(0.01, min(f(w, 1), 1 - min(cx, 0.99))),
+                      h: max(0.01, min(f(h, 1), 1 - min(cy, 0.99))))
+    }
 }
 
 /// Turns a stream of strip signatures into reel keys: `reel-1`, `reel-2`, ...
