@@ -1,0 +1,44 @@
+# iOS checks that cost no EAS builds. The repo is public, so GitHub's macOS
+# runners are free: every Swift compile error is caught here, and EAS is
+# only used for signed device builds.
+name: ios
+
+on:
+  push:
+    paths: ["mobile/**", ".github/workflows/ios.yml"]
+  pull_request:
+    paths: ["mobile/**"]
+  workflow_dispatch:
+
+jobs:
+  core:
+    name: Core tests (Linux)
+    runs-on: ubuntu-latest
+    container: swift:6.2
+    defaults: { run: { working-directory: mobile } }
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift test
+
+  compile:
+    name: Unsigned device build (all targets)
+    runs-on: macos-26
+    defaults: { run: { working-directory: mobile } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm, cache-dependency-path: mobile/package-lock.json }
+      - run: xcodebuild -version
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npx expo prebuild --platform ios --clean
+      - name: xcodebuild (no signing)
+        run: |
+          set -o pipefail
+          xcodebuild -workspace ios/Asterisk.xcworkspace -scheme Asterisk \
+            -configuration Debug -sdk iphoneos -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee build.log | grep -E "error:|warning: .*(SampleHandler|AsteriskIntents|VisualIntelligence|_shared)|BUILD (SUCCEEDED|FAILED)"
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with: { name: xcodebuild-log, path: mobile/build.log }

@@ -1,0 +1,25 @@
+{
+  "name": "asterisk-mobile",
+  "version": "0.1.0",
+  "main": "index.ts",
+  "private": true,
+  "scripts": {
+    "start": "expo start --dev-client",
+    "typecheck": "tsc --noEmit",
+    "test:core": "podman run --rm -v \"$PWD\":/src:Z -w /src docker.io/library/swift:6.2 swift test --scratch-path /tmp/build",
+    "prebuild:ios": "expo prebuild --platform ios --no-install --clean"
+  },
+  "dependencies": {
+    "expo": "~57.0.28",
+    "expo-build-properties": "~57.0.22",
+    "expo-dev-client": "~57.0.20",
+    "expo-status-bar": "~57.0.1",
+    "react": "19.2.3",
+    "react-native": "0.86.3"
+  },
+  "devDependencies": {
+    "@bacons/apple-targets": "^5.0.0",
+    "@types/react": "~19.2.2",
+    "typescript": "~6.0.3"
+  }
+}

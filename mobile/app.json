@@ -1,0 +1,25 @@
+{
+  "expo": {
+    "name": "Asterisk",
+    "slug": "asterisk",
+    "scheme": "asterisk",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "bundleIdentifier": "dev.tdporter.asterisk",
+      "supportsTablet": false,
+      "entitlements": {
+        "com.apple.security.application-groups": ["group.dev.tdporter.asterisk"]
+      },
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    },
+    "plugins": [
+      ["expo-build-properties", { "ios": { "deploymentTarget": "17.0" } }],
+      "@bacons/apple-targets"
+    ]
+  }
+}

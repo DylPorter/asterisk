@@ -54,6 +54,15 @@ public class AsteriskBridgeModule: Module {
       UserDefaults(suiteName: Names.appGroup)?.string(forKey: Names.serverKey) ?? ""
     }
 
+    /// Upload chunks after the dwell, before a tap. The user's choice only; the server cannot set it.
+    Function("setPrefetch") { (on: Bool) in
+      UserDefaults(suiteName: Names.appGroup)?.set(on, forKey: "prefetch")
+    }
+
+    Function("getPrefetch") { () -> Bool in
+      UserDefaults(suiteName: Names.appGroup)?.bool(forKey: "prefetch") ?? false
+    }
+
     Function("status") { () -> String? in read(Names.statusFile) }
 
     Function("lastResult") { () -> String? in read(Names.resultFile) }

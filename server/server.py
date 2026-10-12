@@ -48,7 +48,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # yt-dlp needs a JS runtime for YouTube extraction; deno lives in ~/.deno.
 os.environ["PATH"] = os.path.expanduser("~/.deno/bin") + os.pathsep + os.environ.get("PATH", "")
@@ -461,6 +461,57 @@ async def v2_check(req: V2CheckRequest) -> V2CheckResponse:
     print(f"[v2]    {res.status:<14} {req.app:<9} {req.channel:<20} src={res.source} "
           f"silent={res.captured_silent} {res.seconds:.1f}s {res.detail or ''}", flush=True)
     return res
+
+
+# --- iOS test build support -------------------------------------------------
+# The broadcast extension pulls its tunables from here at start, so a wrong
+# guess about dwell, swipe thresholds or the caption strip costs a server
+# restart instead of an EAS build. The phone clamps the privacy-relevant
+# values and never takes `prefetch` from the server (CaptureConfig.swift).
+IOS_CONFIG_FILE = os.path.join(os.path.dirname(__file__), "ios_config.json")
+DIAG_FILE = os.path.join(os.path.dirname(__file__), "out", "diag.jsonl")
+DIAG_MAX_FILE = 20 * 1024 * 1024
+DIAG_MAX_LINES = 500
+DIAG_MAX_LINE = 2048
+
+
+@app.get("/v2/config")
+async def v2_config() -> dict[str, Any]:
+    try:
+        with open(IOS_CONFIG_FILE) as f:
+            cfg = json.load(f)
+        return cfg if isinstance(cfg, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+class DiagRequest(BaseModel):
+    source: str = Field(max_length=32)
+    lines: list[str] = Field(max_length=DIAG_MAX_LINES)
+
+
+@app.post("/v2/diag")
+async def v2_diag(req: DiagRequest) -> dict[str, Any]:
+    """Diagnostics from a test phone: counts, levels and timings, never audio.
+
+    Unauthenticated, so bounded: lines and batch size are capped by the
+    model, and the file is truncated rather than allowed to grow without limit.
+    """
+    if not _APP.match(req.source):
+        raise HTTPException(400, "bad source")
+    now = int(time.time() * 1000)
+    out = []
+    for line in req.lines:
+        out.append(json.dumps({"rx": now, "src": req.source, "line": line[:DIAG_MAX_LINE]}))
+    os.makedirs(os.path.dirname(DIAG_FILE), exist_ok=True)
+    try:
+        if os.path.getsize(DIAG_FILE) > DIAG_MAX_FILE:
+            os.replace(DIAG_FILE, DIAG_FILE + ".1")
+    except OSError:
+        pass
+    with open(DIAG_FILE, "a") as f:
+        f.write("".join(l + "\n" for l in out))
+    return {"ok": True, "n": len(out)}
 
 
 @app.get("/health")
